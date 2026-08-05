@@ -1,0 +1,74 @@
+import requests, time, json
+
+OLLAMA = "http://localhost:11434"
+GEN_MODEL = "llama3.1:8b"
+TRANS_MODEL = "translategemma"   # 실제 이름으로 수정
+
+SOAP_SYSTEM = """당신은 진료 대화를 SOAP 형식 의무기록으로 정리하는 도구입니다.
+
+각 섹션의 정의:
+- S (Subjective, 주관적 정보): 환자가 진술한 증상, 병력, 불편감
+- O (Objective, 객관적 소견): 측정된 활력징후, 신체검진 소견, 검사 결과
+- A (Assessment, 평가): 위 정보를 종합한 임상적 판단 및 진단
+- P (Plan, 계획): 처방, 추가 검사, 교육, 추적 계획
+
+규칙:
+- 대화에 명시된 내용만 사용하고 추측하지 마십시오
+- 대화를 그대로 옮기지 말고 의무기록 문체로 재작성하십시오
+- 각 섹션은 "S:", "O:", "A:", "P:" 로 시작하십시오"""
+
+EN_DIALOGUE = """Doctor: Hello, how can I help you today?
+Patient: I've had a sore throat and fever for three days.
+Doctor: Any cough or pain when swallowing?
+Patient: Yes, painful swallowing. No cough.
+Doctor: Your temperature is 38.5. I see white patches on your tonsils.
+Patient: Is it serious?
+Doctor: Likely bacterial pharyngitis. I'll prescribe amoxicillin for 10 days."""
+
+
+def ask(model, prompt, system=None, **opts):
+    msgs = ([{"role": "system", "content": system}] if system else []) \
+         + [{"role": "user", "content": prompt}]
+    t0 = time.time()
+    r = requests.post(f"{OLLAMA}/api/chat", json={
+        "model": model, "messages": msgs, "stream": False,
+        "keep_alive": "10m",
+        "options": {"temperature": 0.2, "num_ctx": 4096, "seed": 42, **opts},
+    }, timeout=1800)
+    r.raise_for_status()
+    d = r.json()
+    tps = d.get("eval_count", 0) / (d.get("eval_duration", 1) / 1e9)
+    return d["message"]["content"], time.time() - t0, tps
+
+
+if __name__ == "__main__":
+    log = {}
+
+    # 1) 입력 번역: 영어 대화 → 한국어
+    print("[1/3] 대화 번역 중...")
+    ko, t1, s1 = ask(TRANS_MODEL,
+        f"다음 의료 대화를 한국어로 번역하세요. 화자 표기(Doctor/Patient)는 "
+        f"의사/환자로 바꾸고, 약품명은 원문을 유지하세요.\n\n{EN_DIALOGUE}")
+    print(ko, f"\n({t1:.1f}s, {s1:.1f} tok/s)\n" + "="*60)
+
+    # 2) SOAP 생성
+    print("[2/3] SOAP 생성 중...")
+    soap, t2, s2 = ask(GEN_MODEL,
+        f"다음 진료 대화를 SOAP로 정리하세요.\n\n{ko}", system=SOAP_SYSTEM)
+    print(soap, f"\n({t2:.1f}s, {s2:.1f} tok/s)\n" + "="*60)
+
+    # 3) 출력 번역: 한국어 SOAP → 영어
+    print("[3/3] SOAP 역번역 중...")
+    en, t3, s3 = ask(TRANS_MODEL,
+        f"다음 의무기록을 영어로 번역하세요. 의학 용어는 정확한 임상 표현을 "
+        f"사용하고, 약품명은 원문을 유지하세요.\n\n{soap}")
+    print(en, f"\n({t3:.1f}s, {s3:.1f} tok/s)")
+
+    print("\n" + "="*60)
+    print(f"총 {t1+t2+t3:.1f}초 | 번역 {t1+t3:.1f}s / 생성 {t2:.1f}s")
+
+    with open("pipeline_result.json", "w", encoding="utf-8") as f:
+        json.dump({"en_input": EN_DIALOGUE, "ko_dialogue": ko,
+                   "ko_soap": soap, "en_soap": en,
+                   "times": {"trans_in": t1, "gen": t2, "trans_out": t3}},
+                  f, ensure_ascii=False, indent=2)
